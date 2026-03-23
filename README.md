@@ -66,7 +66,8 @@ ANYCP_TOKEN=your-secret-token uvicorn main:app --host 0.0.0.0 --port 8787
 
 | Variable | Default | Description |
 |---|---|---|
-| `ANYCP_TOKEN` | *(required)* | Auth token for API access |
+| `ANYCP_TOKEN` | | Auth token for API access (one of `ANYCP_TOKEN` or `ANYCP_SSH_KEYS_FILE` required) |
+| `ANYCP_SSH_KEYS_FILE` | | Path to authorized_keys file — tokens are derived from SSH public keys |
 | `ANYCP_TTL` | `3600` | Seconds before transfers expire |
 | `ANYCP_POLL_TIMEOUT` | `30` | Long-poll timeout in seconds |
 
@@ -85,13 +86,40 @@ scp cli/anycp remote-host:~/bin/
 chmod +x ~/bin/anycp
 ```
 
-Then configure (once per host):
+### Option A: SSH key auth (zero-config on remote hosts)
+
+If you SSH with agent forwarding (`ssh -A`), the CLI automatically derives a token from your SSH public key — no manual token configuration needed on remote hosts.
+
+**Server side** — point to an authorized_keys file:
+```bash
+ANYCP_SSH_KEYS_FILE=~/.ssh/authorized_keys uvicorn main:app --host 0.0.0.0 --port 8787
+```
+
+**Client side** — only the server URL is needed:
+```bash
+anycp config --server http://your-server:8787
+```
+
+The token is derived as `SHA256(key_type + " " + key_data)`. You can view it with:
+```bash
+anycp token
+```
+
+### Option B: Manual token
+
+Configure once per host:
 
 ```bash
 anycp config --server http://your-server:8787 --token your-secret-token
 ```
 
 Or run `anycp config` without flags for interactive prompts.
+
+### Token resolution order
+
+1. `token` in config file
+2. `ANYCP_TOKEN` environment variable
+3. SSH key (agent via `SSH_AUTH_SOCK`, then `~/.ssh/*.pub`)
 
 Config is stored in `~/.config/anycp/config` (mode 0600).
 

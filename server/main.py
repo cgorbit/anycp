@@ -6,6 +6,7 @@ protocol selection, issues commands, handles retries.
 """
 
 import asyncio
+import hashlib
 import os
 import time
 import uuid
@@ -19,16 +20,52 @@ TOKEN = os.environ.get("ANYCP_TOKEN", "")
 TTL = int(os.environ.get("ANYCP_TTL", "3600"))
 POLL_TIMEOUT = int(os.environ.get("ANYCP_POLL_TIMEOUT", "30"))
 
+# --- SSH key-derived tokens ---
+_KEY_PREFIXES = (
+    "ssh-rsa", "ssh-ed25519", "ssh-dss",
+    "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521",
+    "sk-ssh-ed25519", "sk-ecdsa-sha2-nistp256",
+)
+
+def _load_ssh_tokens():
+    path = os.environ.get("ANYCP_SSH_KEYS_FILE", "")
+    if not path:
+        return set()
+    tokens = set()
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                for prefix in _KEY_PREFIXES:
+                    idx = line.find(prefix)
+                    if idx >= 0:
+                        parts = line[idx:].split()
+                        if len(parts) >= 2:
+                            canonical = parts[0] + " " + parts[1]
+                            tokens.add(hashlib.sha256(canonical.encode()).hexdigest())
+                        break
+    except FileNotFoundError:
+        pass
+    return tokens
+
+SSH_TOKENS = _load_ssh_tokens()
+
 # --- Storage ---
 transfers: dict[str, dict] = {}
 
 
 # --- Auth ---
 async def auth(request: Request):
-    if not TOKEN:
-        raise HTTPException(500, "ANYCP_TOKEN not configured on server")
-    if request.headers.get("Authorization") != f"Bearer {TOKEN}":
-        raise HTTPException(401, "Unauthorized")
+    if not TOKEN and not SSH_TOKENS:
+        raise HTTPException(500, "ANYCP_TOKEN or ANYCP_SSH_KEYS_FILE not configured")
+    bearer = (request.headers.get("Authorization") or "").removeprefix("Bearer ").strip()
+    if TOKEN and bearer == TOKEN:
+        return
+    if SSH_TOKENS and bearer in SSH_TOKENS:
+        return
+    raise HTTPException(401, "Unauthorized")
 
 
 # ===================================================================

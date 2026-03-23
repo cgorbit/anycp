@@ -42,6 +42,63 @@ def load_config():
     return cfg
 
 
+# ---------------------------------------------------------------------------
+# SSH key-derived token
+# ---------------------------------------------------------------------------
+
+def _token_from_pubkey(key_line):
+    """Derive a deterministic token from an SSH public key line.
+
+    Hashes 'type base64_key' (excluding the comment) so that the same key
+    always produces the same token regardless of host-specific comments.
+    """
+    parts = key_line.split()
+    if len(parts) >= 2:
+        return hashlib.sha256((parts[0] + " " + parts[1]).encode()).hexdigest()
+    return None
+
+
+def _ssh_pubkeys():
+    """Get SSH public key lines — from agent first, then local files."""
+    # Try SSH agent (works with agent forwarding)
+    if os.environ.get("SSH_AUTH_SOCK"):
+        try:
+            r = subprocess.run(
+                ["ssh-add", "-L"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, timeout=5,
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                return r.stdout.strip().splitlines()
+        except Exception:
+            pass
+
+    # Fall back to local public key files
+    ssh_dir = Path.home() / ".ssh"
+    for name in ("id_ed25519.pub", "id_ecdsa.pub", "id_rsa.pub"):
+        pub = ssh_dir / name
+        if pub.exists():
+            line = pub.read_text().strip().splitlines()[0]
+            if line:
+                return [line]
+    return []
+
+
+def get_token(cfg):
+    """Resolve auth token: config → env → SSH key."""
+    token = cfg.get("token", "")
+    if token:
+        return token
+    token = os.environ.get("ANYCP_TOKEN", "")
+    if token:
+        return token
+    for key in _ssh_pubkeys():
+        t = _token_from_pubkey(key)
+        if t:
+            return t
+    return ""
+
+
 def save_config(cfg):
     CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
     CONFIG_FILE.write_text("\n".join(f"{k}={v}" for k, v in cfg.items()) + "\n")
@@ -64,7 +121,7 @@ def _ssl_ctx(cfg):
 def api(cfg, method, path, *, body=None, silent=False):
     """JSON request to meta-server."""
     server = cfg.get("server_url", "").rstrip("/")
-    token = cfg.get("token", "")
+    token = get_token(cfg)
     if not server:
         die("Not configured. Run: anycp config")
 
@@ -95,7 +152,7 @@ def api(cfg, method, path, *, body=None, silent=False):
 def poll(cfg, tid, side, seq):
     """Long-poll for coordinator events.  Returns {"events": [...]}."""
     server = cfg.get("server_url", "").rstrip("/")
-    token = cfg.get("token", "")
+    token = get_token(cfg)
     url = "{}/api/transfers/{}/poll/{}?seq={}".format(server, tid, side, seq)
     req = urllib.request.Request(url)
     req.add_header("Authorization", "Bearer " + token)
@@ -640,6 +697,18 @@ def cmd_config(args, cfg):
     print("Saved to {}".format(CONFIG_FILE))
 
 
+def cmd_token(args, cfg):
+    keys = _ssh_pubkeys()
+    if not keys:
+        die("No SSH keys found (agent or ~/.ssh/*.pub)")
+    for key in keys:
+        t = _token_from_pubkey(key)
+        parts = key.split()
+        comment = parts[2] if len(parts) >= 3 else parts[0]
+        if t:
+            print("{}  {}".format(t, comment))
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -675,6 +744,8 @@ def main():
     cf.add_argument("--server", help="Server URL")
     cf.add_argument("--token", help="Auth token")
 
+    sub.add_parser("token", help="Show SSH-derived auth token(s)")
+
     args = p.parse_args()
     cfg = load_config()
 
@@ -685,6 +756,7 @@ def main():
         "ls": cmd_ls,
         "rm": cmd_rm,
         "config": cmd_config,
+        "token": cmd_token,
     }
 
     fn = handlers.get(args.cmd)

@@ -1,0 +1,604 @@
+#!/usr/bin/env python3
+"""anycp — seamless file transfer between SSH hosts.
+
+Single-file CLI with zero external dependencies (Python 3.8+ stdlib only).
+The meta-server orchestrates; both sides follow commands via long-polling.
+"""
+
+import argparse
+import hashlib
+import http.server
+import json
+import os
+import secrets
+import shutil
+import socket
+import ssl
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+CONFIG_FILE = Path.home() / ".config" / "anycp" / "config"
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+def load_config():
+    cfg = {}
+    if CONFIG_FILE.exists():
+        for line in CONFIG_FILE.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                cfg[k.strip()] = v.strip()
+    return cfg
+
+
+def save_config(cfg):
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text("\n".join(f"{k}={v}" for k, v in cfg.items()) + "\n")
+    CONFIG_FILE.chmod(0o600)
+
+
+# ---------------------------------------------------------------------------
+# HTTP helpers (meta-server API + long-polling)
+# ---------------------------------------------------------------------------
+
+def _ssl_ctx(cfg):
+    if cfg.get("verify_ssl", "true").lower() == "false":
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return ctx
+    return None
+
+
+def api(cfg, method, path, *, body=None, silent=False):
+    """JSON request to meta-server."""
+    server = cfg.get("server_url", "").rstrip("/")
+    token = cfg.get("token", "")
+    if not server:
+        die("Not configured. Run: anycp config")
+
+    if body is not None:
+        raw = json.dumps(body).encode()
+        req = urllib.request.Request(server + path, data=raw, method=method)
+        req.add_header("Content-Type", "application/json")
+    else:
+        req = urllib.request.Request(server + path, method=method)
+    req.add_header("Authorization", "Bearer " + token)
+
+    try:
+        return json.loads(urllib.request.urlopen(req, context=_ssl_ctx(cfg)).read())
+    except urllib.error.HTTPError as e:
+        if silent:
+            return None
+        try:
+            detail = json.loads(e.read()).get("detail", str(e))
+        except Exception:
+            detail = str(e)
+        die("Server error ({}): {}".format(e.code, detail))
+    except urllib.error.URLError as e:
+        if silent:
+            return None
+        die("Cannot connect to server: {}".format(e.reason))
+
+
+def poll(cfg, tid, side, seq):
+    """Long-poll for coordinator events.  Returns {"events": [...]}."""
+    server = cfg.get("server_url", "").rstrip("/")
+    token = cfg.get("token", "")
+    url = "{}/api/transfers/{}/poll/{}?seq={}".format(server, tid, side, seq)
+    req = urllib.request.Request(url)
+    req.add_header("Authorization", "Bearer " + token)
+    try:
+        resp = urllib.request.urlopen(req, context=_ssl_ctx(cfg), timeout=35)
+        return json.loads(resp.read())
+    except (urllib.error.URLError, socket.timeout, OSError):
+        return {"events": []}
+
+
+def msg(cfg, tid, side, msg_type, data=None):
+    """Send a message to the coordinator."""
+    api(cfg, "POST", "/api/transfers/{}/msg/{}".format(tid, side),
+        body={"type": msg_type, "data": data or {}}, silent=True)
+
+
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
+
+def die(m):
+    print("error: " + m, file=sys.stderr)
+    sys.exit(1)
+
+
+def fmt_size(n):
+    for u in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return "{}{}".format(int(n), u) if u == "B" else "{:.1f}{}".format(n, u)
+        n /= 1024
+    return "{:.1f}TB".format(n)
+
+
+def fmt_age(ts):
+    s = time.time() - ts
+    if s < 60:   return "{}s ago".format(int(s))
+    if s < 3600: return "{}m ago".format(int(s / 60))
+    if s < 86400: return "{}h ago".format(int(s / 3600))
+    return "{}d ago".format(int(s / 86400))
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(65536)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def progress_bar(current, total):
+    if total <= 0:
+        return
+    pct = min(current * 100 // total, 100)
+    filled = pct // 5
+    bar = "#" * filled + "-" * (20 - filled)
+    sys.stdout.write("\r  [{}] {}% {}/{}".format(
+        bar, pct, fmt_size(current), fmt_size(total)))
+    sys.stdout.flush()
+    if current >= total:
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
+
+def get_host_address():
+    """Best-effort detection of a routable IP for this host."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("10.255.255.255", 1))
+        ip = s.getsockname()[0]
+        s.close()
+        if ip and ip != "0.0.0.0":
+            return ip
+    except Exception:
+        pass
+    fqdn = socket.getfqdn()
+    if fqdn and fqdn != "localhost":
+        return fqdn
+    return socket.gethostname()
+
+
+def available_protocols():
+    """Detect which transfer protocols this host can use."""
+    protos = ["http"]  # always available (stdlib)
+    if shutil.which("sky"):
+        protos.append("sky")
+    return protos
+
+
+class TransferError(Exception):
+    pass
+
+
+# ===========================================================================
+# Protocol handlers — push side
+# Each returns (response_data_dict, cleanup_fn_or_None)
+# ===========================================================================
+
+class _FileServer:
+    """Single-file HTTP server for direct peer-to-peer transfer."""
+
+    def __init__(self, filepath, token):
+        self.filepath = str(filepath)
+        self.filesize = os.path.getsize(filepath)
+        self.token = token
+        parent = self
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path != "/" + parent.token:
+                    self.send_response(404); self.end_headers(); return
+                self.send_response(200)
+                self.send_header("Content-Length", str(parent.filesize))
+                self.send_header("Content-Type", "application/octet-stream")
+                self.end_headers()
+                try:
+                    with open(parent.filepath, "rb") as f:
+                        while True:
+                            chunk = f.read(65536)
+                            if not chunk:
+                                break
+                            self.wfile.write(chunk)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+            def log_message(self, *a):
+                pass
+
+        self.httpd = http.server.HTTPServer(("0.0.0.0", 0), H)
+        self.port = self.httpd.server_address[1]
+        self._t = None
+
+    def start(self):
+        self._t = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self._t.start()
+
+    def stop(self):
+        self.httpd.shutdown()
+        if self._t:
+            self._t.join(timeout=5)
+
+
+def _push_http(filepath, args, cfg):
+    token = secrets.token_urlsafe(24)
+    srv = _FileServer(filepath, token)
+    srv.start()
+    host = args.host or cfg.get("push_host") or get_host_address()
+    print("  HTTP server on {}:{}".format(host, srv.port))
+    return {"host": host, "port": srv.port, "token": token}, srv.stop
+
+
+def _push_sky(filepath, args, cfg):
+    proc = subprocess.Popen(
+        ["sky", "share", str(filepath)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    torrent_id = proc.stdout.readline().strip()
+    if not torrent_id:
+        err = proc.stderr.read()
+        proc.wait()
+        raise TransferError("sky share failed: {}".format(err or "no output"))
+
+    def cleanup():
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+    print("  sky share: {}".format(torrent_id))
+    return {"torrent_id": torrent_id, "path": str(filepath)}, cleanup
+
+
+# event_type → (reply_msg_type, handler_fn)
+PUSH_HANDLERS = {
+    "start_http_server": ("http_server_ready", _push_http),
+    "start_sky_share":   ("sky_share_ready",   _push_sky),
+}
+
+
+# ===========================================================================
+# Protocol handlers — pop side
+# Each downloads file to `dest` or raises TransferError
+# ===========================================================================
+
+def _pop_http(data, dest):
+    url = "http://{}:{}/{}".format(data["host"], data["port"], data["token"])
+    print("  Downloading from {}:{}".format(data["host"], data["port"]))
+    try:
+        resp = urllib.request.urlopen(urllib.request.Request(url))
+    except urllib.error.URLError as e:
+        raise TransferError("Cannot connect to push host: {}".format(e.reason))
+
+    total = int(resp.headers.get("Content-Length", 0))
+    downloaded = 0
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with open(dest, "wb") as f:
+        while True:
+            chunk = resp.read(65536)
+            if not chunk:
+                break
+            f.write(chunk)
+            downloaded += len(chunk)
+            progress_bar(downloaded, total)
+
+
+def _pop_sky(data, dest):
+    torrent_id = data["torrent_id"]
+    original_path = data["path"]
+
+    tmpdir = tempfile.mkdtemp(prefix="anycp-sky-")
+    try:
+        print("  Running: sky get {}".format(torrent_id))
+        result = subprocess.run(["sky", "get", torrent_id], cwd=tmpdir)
+        if result.returncode != 0:
+            raise TransferError("sky get failed (exit {})".format(
+                result.returncode))
+
+        src = Path(tmpdir) / original_path
+        if not src.is_file():
+            raise TransferError(
+                "sky get did not produce expected file at {}".format(
+                    original_path))
+
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(src), str(dest))
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# event_type → handler_fn
+POP_HANDLERS = {
+    "download_http": _pop_http,
+    "download_sky":  _pop_sky,
+}
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+def cmd_push(args, cfg):
+    filepath = Path(args.file)
+    if not filepath.is_file():
+        die("{}: not a file".format(filepath))
+
+    size = filepath.stat().st_size
+    name = filepath.name
+
+    sys.stdout.write("Computing checksum... ")
+    sys.stdout.flush()
+    checksum = sha256_file(filepath)
+    print("ok")
+
+    caps = available_protocols()
+
+    res = api(cfg, "POST", "/api/transfers", body={
+        "filename": name,
+        "path": str(filepath),
+        "abs_path": str(filepath.absolute()),
+        "resolved_path": str(filepath.resolve()),
+        "cwd": os.getcwd(),
+        "size": size,
+        "checksum": checksum,
+        "push_host": socket.gethostname(),
+        "capabilities": caps,
+    })
+    tid = res["id"]
+
+    print("Registered {} ({}) [protocols: {}]".format(
+        name, fmt_size(size), ", ".join(caps)))
+    print("Transfer ID: {}".format(tid))
+    print("Waiting for receiver... (Ctrl+C to cancel)")
+
+    seq = 0
+    cleanup = None
+    try:
+        while True:
+            result = poll(cfg, tid, "push", seq)
+            for ev in result.get("events", []):
+                seq = ev["seq"]
+                etype = ev["type"]
+                edata = ev.get("data", {})
+
+                if etype == "claimed":
+                    print("Receiver connected ({})".format(
+                        edata.get("pop_host", "?")))
+
+                elif etype in PUSH_HANDLERS:
+                    reply_type, handler = PUSH_HANDLERS[etype]
+                    try:
+                        data, new_cleanup = handler(filepath, args, cfg)
+                        if cleanup:
+                            cleanup()
+                        cleanup = new_cleanup
+                        msg(cfg, tid, "push", reply_type, data)
+                    except TransferError as e:
+                        msg(cfg, tid, "push", "error", {"error": str(e)})
+
+                elif etype == "transfer_complete":
+                    print("Transfer completed!")
+                    return
+
+                elif etype == "transfer_failed":
+                    die("Transfer failed: {}".format(
+                        edata.get("error", "unknown")))
+
+    except KeyboardInterrupt:
+        print("\nCancelled.")
+        api(cfg, "DELETE", "/api/transfers/{}".format(tid), silent=True)
+    finally:
+        if cleanup:
+            cleanup()
+
+
+def cmd_pop(args, cfg):
+    items = api(cfg, "GET", "/api/transfers")
+    if not items:
+        die("No transfers available")
+
+    if len(items) == 1:
+        sel = items[0]
+        print("{} ({}) from {} — {}".format(
+            sel["filename"], fmt_size(sel["size"]),
+            sel["push_host"], fmt_age(sel["created_at"])))
+    else:
+        print("Available transfers:")
+        for i, t in enumerate(items, 1):
+            print("  [{}] {} ({}) from {} — {}".format(
+                i, t["filename"], fmt_size(t["size"]),
+                t["push_host"], fmt_age(t["created_at"])))
+        while True:
+            try:
+                c = input("Select [1-{}]: ".format(len(items))).strip()
+                idx = int(c) - 1
+                if 0 <= idx < len(items):
+                    sel = items[idx]
+                    break
+            except (ValueError, EOFError, KeyboardInterrupt):
+                print()
+                return
+            print("Invalid choice.")
+
+    tid = sel["id"]
+    name = sel["filename"]
+
+    # Destination
+    if args.destination:
+        dest = Path(args.destination)
+        if dest.is_dir():
+            dest = dest / name
+    else:
+        dest = Path.cwd() / name
+
+    if dest.exists() and not args.force:
+        die("{} already exists (use -f to overwrite)".format(dest))
+
+    # Claim — triggers coordination
+    caps = available_protocols()
+    api(cfg, "POST", "/api/transfers/{}/claim".format(tid), body={
+        "pop_host": socket.gethostname(),
+        "capabilities": caps,
+    })
+    print("Claimed. Waiting for coordinator...")
+
+    # Event loop
+    seq = 0
+    try:
+        while True:
+            result = poll(cfg, tid, "pop", seq)
+            for ev in result.get("events", []):
+                seq = ev["seq"]
+                etype = ev["type"]
+                edata = ev.get("data", {})
+
+                if etype in POP_HANDLERS:
+                    handler = POP_HANDLERS[etype]
+                    try:
+                        handler(edata, dest)
+                        msg(cfg, tid, "pop", "download_complete")
+                    except TransferError as e:
+                        print("error: {}".format(e), file=sys.stderr)
+                        msg(cfg, tid, "pop", "download_failed",
+                            {"error": str(e)})
+
+                elif etype == "choose_protocol":
+                    options = edata.get("options", [])
+                    print("Choose transfer protocol:")
+                    for i, o in enumerate(options, 1):
+                        print("  [{}] {}".format(i, o))
+                    while True:
+                        try:
+                            c = input("Select: ").strip()
+                            idx = int(c) - 1
+                            if 0 <= idx < len(options):
+                                msg(cfg, tid, "pop", "protocol_chosen",
+                                    {"protocol": options[idx]})
+                                break
+                        except (ValueError, EOFError, KeyboardInterrupt):
+                            break
+
+                elif etype == "transfer_complete":
+                    expected = sel.get("checksum", "")
+                    if expected and dest.is_file():
+                        actual = sha256_file(dest)
+                        if actual != expected:
+                            dest.unlink(missing_ok=True)
+                            die("Checksum mismatch!")
+                    print("Saved to {}".format(dest))
+                    return
+
+                elif etype == "transfer_failed":
+                    die("Transfer failed: {}".format(
+                        edata.get("error", "unknown")))
+
+    except KeyboardInterrupt:
+        print("\nCancelled.")
+
+
+def cmd_ls(args, cfg):
+    items = api(cfg, "GET", "/api/transfers")
+    if not items:
+        print("No transfers available.")
+        return
+    for t in items:
+        print("  {}  {:30s}  {:>10s}  {:20s}  {}".format(
+            t["id"], t["filename"], fmt_size(t["size"]),
+            t["push_host"], fmt_age(t["created_at"])))
+
+
+def cmd_rm(args, cfg):
+    api(cfg, "DELETE", "/api/transfers/{}".format(args.id))
+    print("Deleted {}".format(args.id))
+
+
+def cmd_config(args, cfg):
+    if args.server or args.token:
+        if args.server:
+            cfg["server_url"] = args.server
+        if args.token:
+            cfg["token"] = args.token
+    else:
+        s = input("Server URL [{}]: ".format(cfg.get("server_url", ""))).strip()
+        if s:
+            cfg["server_url"] = s
+        t = input("Token [{}]: ".format(cfg.get("token", ""))).strip()
+        if t:
+            cfg["token"] = t
+    save_config(cfg)
+    print("Saved to {}".format(CONFIG_FILE))
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    p = argparse.ArgumentParser(prog="anycp",
+                                description="Transfer files between SSH hosts")
+    sub = p.add_subparsers(dest="cmd")
+
+    pp = sub.add_parser("push", help="Share a file")
+    pp.add_argument("file", help="File to push")
+    pp.add_argument("--host", help="Address for pop side to reach this host "
+                    "(http protocol, default: auto-detect)")
+
+    po = sub.add_parser("pop", help="Receive a file")
+    po.add_argument("destination", nargs="?", help="Destination path or directory")
+    po.add_argument("-f", "--force", action="store_true",
+                    help="Overwrite existing file")
+
+    pu = sub.add_parser("pull", help="Alias for pop")
+    pu.add_argument("destination", nargs="?", help="Destination path or directory")
+    pu.add_argument("-f", "--force", action="store_true",
+                    help="Overwrite existing file")
+
+    sub.add_parser("ls", help="List available transfers")
+
+    rm = sub.add_parser("rm", help="Remove a transfer")
+    rm.add_argument("id", help="Transfer ID")
+
+    cf = sub.add_parser("config", help="Configure server URL and token")
+    cf.add_argument("--server", help="Server URL")
+    cf.add_argument("--token", help="Auth token")
+
+    args = p.parse_args()
+    cfg = load_config()
+
+    handlers = {
+        "push": cmd_push,
+        "pop": cmd_pop,
+        "pull": cmd_pop,
+        "ls": cmd_ls,
+        "rm": cmd_rm,
+        "config": cmd_config,
+    }
+
+    fn = handlers.get(args.cmd)
+    if fn:
+        fn(args, cfg)
+    else:
+        p.print_help()
+
+
+if __name__ == "__main__":
+    main()

@@ -248,25 +248,19 @@ def _push_http(filepath, args, cfg):
 
 
 def _push_sky(filepath, args, cfg):
-    proc = subprocess.Popen(
+    result = subprocess.run(
         ["sky", "share", str(filepath)],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        timeout=120,
     )
-    torrent_id = proc.stdout.readline().strip()
+    if result.returncode != 0:
+        raise TransferError("sky share failed: {}".format(
+            result.stderr.strip() or "exit {}".format(result.returncode)))
+    torrent_id = result.stdout.strip().splitlines()[0].strip()
     if not torrent_id:
-        err = proc.stderr.read()
-        proc.wait()
-        raise TransferError("sky share failed: {}".format(err or "no output"))
-
-    def cleanup():
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-
+        raise TransferError("sky share produced no output")
     print("  sky share: {}".format(torrent_id))
-    return {"torrent_id": torrent_id, "path": str(filepath)}, cleanup
+    return {"torrent_id": torrent_id, "path": str(filepath)}, None
 
 
 # event_type → (reply_msg_type, handler_fn)

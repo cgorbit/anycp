@@ -46,32 +46,10 @@ def emit(tid: str, side: str, event_type: str, data: dict | None = None):
 
 
 # ===================================================================
-# TransferCoordinator
+# TransferCoordinator — async coroutine per transfer
 # ===================================================================
 
 PROTOCOL_PRIORITY = ["sky", "http"]
-
-# protocol name  →  command sent to push side
-PROTO_TO_PUSH_CMD = {
-    "http": "start_http_server",
-    "sky":  "start_sky_share",
-}
-
-# push reply  →  command sent to pop side
-PUSH_REPLY_TO_POP_CMD = {
-    "http_server_ready": "download_http",
-    "sky_share_ready":   "download_sky",
-}
-
-
-def _start_protocol(tid: str, protocol: str):
-    t = transfers[tid]
-    t["protocol"] = protocol
-    cmd = PROTO_TO_PUSH_CMD.get(protocol)
-    if not cmd:
-        _fail(tid, f"Unknown protocol: {protocol}")
-        return
-    emit(tid, "push", cmd, {})
 
 
 def _fail(tid: str, error: str):
@@ -83,11 +61,52 @@ def _fail(tid: str, error: str):
     emit(tid, "pop",  "transfer_failed", {"error": error})
 
 
-def on_claimed(tid: str):
-    """Called when pop claims a transfer. Start coordination."""
-    t = transfers[tid]
+async def wait_msg(inbox: asyncio.Queue, from_side: str, timeout: float = 300):
+    """Read from inbox, returning the first message from the expected side."""
+    while True:
+        m = await asyncio.wait_for(inbox.get(), timeout=timeout)
+        if m["side"] == from_side:
+            return m
 
-    emit(tid, "push", "claimed", {"pop_host": t["pop_host"]})
+
+async def coordinate_http(tid, t, inbox):
+    """Try HTTP protocol: push starts server, pop downloads."""
+    emit(tid, "push", "start_http_server", {})
+    reply = await wait_msg(inbox, from_side="push")
+    if reply["type"] == "error":
+        return False
+    if reply["type"] != "http_server_ready":
+        return False
+    emit(tid, "pop", "download_http", reply["data"])
+    t["status"] = "transferring"
+    result = await wait_msg(inbox, from_side="pop")
+    return result["type"] == "download_complete"
+
+
+async def coordinate_sky(tid, t, inbox):
+    """Try Sky protocol: push shares, pop downloads."""
+    emit(tid, "push", "start_sky_share", {})
+    reply = await wait_msg(inbox, from_side="push")
+    if reply["type"] == "error":
+        return False
+    if reply["type"] != "sky_share_ready":
+        return False
+    emit(tid, "pop", "download_sky", reply["data"])
+    t["status"] = "transferring"
+    result = await wait_msg(inbox, from_side="pop")
+    return result["type"] == "download_complete"
+
+
+PROTOCOL_COORDINATORS = {
+    "http": coordinate_http,
+    "sky":  coordinate_sky,
+}
+
+
+async def coordinate(tid: str):
+    """Live coroutine that drives one transfer to completion."""
+    t = transfers[tid]
+    inbox = t["_inbox"]
 
     push_caps = set(t.get("push_caps", []))
     pop_caps  = set(t.get("pop_caps", []))
@@ -98,43 +117,29 @@ def on_claimed(tid: str):
             sorted(push_caps), sorted(pop_caps)))
         return
 
-    # Pick best protocol by priority
-    for p in PROTOCOL_PRIORITY:
-        if p in common_caps:
-            _start_protocol(tid, p)
+    emit(tid, "push", "claimed", {"pop_host": t["pop_host"]})
+
+    protocols_to_try = [p for p in PROTOCOL_PRIORITY if p in common_caps]
+    if not protocols_to_try:
+        protocols_to_try = list(common_caps)
+
+    for protocol in protocols_to_try:
+        t["protocol"] = protocol
+        coord_fn = PROTOCOL_COORDINATORS.get(protocol)
+        if not coord_fn:
+            continue
+        try:
+            if await coord_fn(tid, t, inbox):
+                t["status"] = "completed"
+                t["completed_at"] = time.time()
+                emit(tid, "push", "transfer_complete", {})
+                emit(tid, "pop",  "transfer_complete", {})
+                return
+        except asyncio.TimeoutError:
+            _fail(tid, "Timeout during {} protocol".format(protocol))
             return
-    _start_protocol(tid, common_caps.pop())
 
-
-def on_message(tid: str, side: str, msg_type: str, msg_data: dict):
-    """Handle a message from push or pop side."""
-    t = transfers.get(tid)
-    if not t:
-        return
-
-    if side == "push":
-        pop_cmd = PUSH_REPLY_TO_POP_CMD.get(msg_type)
-        if pop_cmd:
-            emit(tid, "pop", pop_cmd, msg_data)
-            t["status"] = "transferring"
-        elif msg_type == "error":
-            _fail(tid, msg_data.get("error", "push-side error"))
-
-    elif side == "pop":
-        if msg_type == "download_complete":
-            t["status"] = "completed"
-            t["completed_at"] = time.time()
-            emit(tid, "push", "transfer_complete", {})
-            emit(tid, "pop",  "transfer_complete", {})
-        elif msg_type == "download_failed":
-            # TODO: retry with next protocol
-            _fail(tid, msg_data.get("error", "download failed"))
-        elif msg_type == "protocol_chosen":
-            proto = msg_data.get("protocol")
-            if proto:
-                _start_protocol(tid, proto)
-            else:
-                _fail(tid, "No protocol chosen")
+    _fail(tid, "All protocols failed")
 
 
 # ===================================================================
@@ -148,7 +153,8 @@ async def cleanup_loop():
         for tid in list(transfers):
             t = transfers.get(tid)
             if t and now - t["created_at"] > TTL:
-                # Wake any long-polling clients before removing
+                if t.get("_task"):
+                    t["_task"].cancel()
                 t["_notify_push"].set()
                 t["_notify_pop"].set()
                 transfers.pop(tid, None)
@@ -224,6 +230,8 @@ async def create_transfer(body: OfferCreate):
         "pop_events": [],
         "_notify_push": asyncio.Event(),
         "_notify_pop": asyncio.Event(),
+        "_inbox": asyncio.Queue(),
+        "_task": None,
     }
     return {"id": tid}
 
@@ -263,7 +271,7 @@ async def claim_transfer(tid: str, body: ClaimBody):
     t["pop_caps"] = body.capabilities
     t["status"] = "coordinating"
 
-    on_claimed(tid)
+    t["_task"] = asyncio.create_task(coordinate(tid))
 
     return {"ok": True}
 
@@ -308,7 +316,7 @@ async def send_message(tid: str, side: str, body: MsgBody):
     if not t:
         raise HTTPException(404, "Transfer not found")
 
-    on_message(tid, side, body.type, body.data)
+    await t["_inbox"].put({"side": side, "type": body.type, "data": body.data})
     return {"ok": True}
 
 
@@ -317,6 +325,8 @@ async def delete_transfer(tid: str):
     t = transfers.pop(tid, None)
     if not t:
         raise HTTPException(404, "Transfer not found")
+    if t.get("_task"):
+        t["_task"].cancel()
     t["_notify_push"].set()
     t["_notify_pop"].set()
     return {"status": "deleted"}

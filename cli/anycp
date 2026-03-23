@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import zlib
 import time
 import urllib.error
 import urllib.request
@@ -140,7 +141,7 @@ def sha256_file(path):
     h = hashlib.sha256()
     with open(path, "rb") as f:
         while True:
-            chunk = f.read(65536)
+            chunk = f.read(1048576)
             if not chunk:
                 break
             h.update(chunk)
@@ -183,6 +184,8 @@ def available_protocols():
     protos = ["http"]  # always available (stdlib)
     if shutil.which("sky"):
         protos.append("sky")
+    if shutil.which("nc"):
+        protos.append("nc")
     return protos
 
 
@@ -208,17 +211,32 @@ class _FileServer:
             def do_GET(self):
                 if self.path != "/" + parent.token:
                     self.send_response(404); self.end_headers(); return
+                use_gzip = "gzip" in self.headers.get("Accept-Encoding", "")
                 self.send_response(200)
-                self.send_header("Content-Length", str(parent.filesize))
                 self.send_header("Content-Type", "application/octet-stream")
+                if use_gzip:
+                    self.send_header("Content-Encoding", "gzip")
+                    self.send_header("X-Uncompressed-Size", str(parent.filesize))
+                else:
+                    self.send_header("Content-Length", str(parent.filesize))
                 self.end_headers()
                 try:
-                    with open(parent.filepath, "rb") as f:
-                        while True:
-                            chunk = f.read(65536)
-                            if not chunk:
-                                break
-                            self.wfile.write(chunk)
+                    if use_gzip:
+                        comp = zlib.compressobj(1, zlib.DEFLATED, 31)
+                        with open(parent.filepath, "rb") as f:
+                            while True:
+                                chunk = f.read(1048576)
+                                if not chunk:
+                                    break
+                                self.wfile.write(comp.compress(chunk))
+                        self.wfile.write(comp.flush())
+                    else:
+                        with open(parent.filepath, "rb") as f:
+                            while True:
+                                chunk = f.read(1048576)
+                                if not chunk:
+                                    break
+                                self.wfile.write(chunk)
                 except (BrokenPipeError, ConnectionResetError):
                     pass
             def log_message(self, *a):
@@ -263,10 +281,37 @@ def _push_sky(filepath, args, cfg):
     return {"torrent_id": torrent_id, "path": str(filepath)}, None
 
 
+def _push_nc(filepath, args, cfg):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("", 0))
+    port = s.getsockname()[1]
+    s.close()
+
+    f = open(filepath, "rb")
+    proc = subprocess.Popen(
+        ["nc", "-l", "-q", "1", "-p", str(port)],
+        stdin=f, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+    )
+
+    host = args.host or cfg.get("push_host") or get_host_address()
+    print("  nc listening on {}:{}".format(host, port))
+
+    def cleanup():
+        f.close()
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+    return {"host": host, "port": port}, cleanup
+
+
 # event_type → (reply_msg_type, handler_fn)
 PUSH_HANDLERS = {
     "start_http_server": ("http_server_ready", _push_http),
     "start_sky_share":   ("sky_share_ready",   _push_sky),
+    "start_nc_listen":   ("nc_listen_ready",   _push_nc),
 }
 
 
@@ -278,22 +323,37 @@ PUSH_HANDLERS = {
 def _pop_http(data, dest):
     url = "http://{}:{}/{}".format(data["host"], data["port"], data["token"])
     print("  Downloading from {}:{}".format(data["host"], data["port"]))
+    req = urllib.request.Request(url)
+    req.add_header("Accept-Encoding", "gzip")
     try:
-        resp = urllib.request.urlopen(urllib.request.Request(url))
+        resp = urllib.request.urlopen(req)
     except urllib.error.URLError as e:
         raise TransferError("Cannot connect to push host: {}".format(e.reason))
 
-    total = int(resp.headers.get("Content-Length", 0))
-    downloaded = 0
+    is_gzip = resp.headers.get("Content-Encoding") == "gzip"
+    if is_gzip:
+        total = int(resp.headers.get("X-Uncompressed-Size", 0))
+        decomp = zlib.decompressobj(31)
+    else:
+        total = int(resp.headers.get("Content-Length", 0))
+
+    written = 0
     dest.parent.mkdir(parents=True, exist_ok=True)
     with open(dest, "wb") as f:
         while True:
-            chunk = resp.read(65536)
-            if not chunk:
+            raw = resp.read(1048576)
+            if not raw:
                 break
+            chunk = decomp.decompress(raw) if is_gzip else raw
             f.write(chunk)
-            downloaded += len(chunk)
-            progress_bar(downloaded, total)
+            written += len(chunk)
+            progress_bar(written, total)
+        if is_gzip:
+            chunk = decomp.flush()
+            if chunk:
+                f.write(chunk)
+                written += len(chunk)
+                progress_bar(written, total)
 
 
 def _pop_sky(data, dest):
@@ -320,10 +380,28 @@ def _pop_sky(data, dest):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def _pop_nc(data, dest):
+    host = data["host"]
+    port = data["port"]
+    print("  Downloading via nc from {}:{}".format(host, port))
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    connect_timeout = 15
+    with open(dest, "wb") as f:
+        result = subprocess.run(
+            ["nc", "-w", str(timeout), host, str(port)],
+            stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.PIPE,
+            timeout=600,
+        )
+    if result.returncode != 0:
+        raise TransferError("nc failed: {}".format(
+            result.stderr.decode().strip() or "exit {}".format(result.returncode)))
+
+
 # event_type → handler_fn
 POP_HANDLERS = {
     "download_http": _pop_http,
     "download_sky":  _pop_sky,
+    "download_nc":   _pop_nc,
 }
 
 

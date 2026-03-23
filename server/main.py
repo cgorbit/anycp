@@ -49,7 +49,7 @@ def emit(tid: str, side: str, event_type: str, data: dict | None = None):
 # TransferCoordinator — async coroutine per transfer
 # ===================================================================
 
-PROTOCOL_PRIORITY = ["sky", "http"]
+PROTOCOL_PRIORITY = ["sky", "nc", "http"]
 
 
 def _fail(tid: str, error: str):
@@ -97,9 +97,24 @@ async def coordinate_sky(tid, t, inbox):
     return result["type"] == "download_complete"
 
 
+async def coordinate_nc(tid, t, inbox):
+    """Try nc protocol: push listens, pop connects."""
+    emit(tid, "push", "start_nc_listen", {})
+    reply = await wait_msg(inbox, from_side="push")
+    if reply["type"] == "error":
+        return False
+    if reply["type"] != "nc_listen_ready":
+        return False
+    emit(tid, "pop", "download_nc", reply["data"])
+    t["status"] = "transferring"
+    result = await wait_msg(inbox, from_side="pop")
+    return result["type"] == "download_complete"
+
+
 PROTOCOL_COORDINATORS = {
     "http": coordinate_http,
     "sky":  coordinate_sky,
+    "nc":   coordinate_nc,
 }
 
 

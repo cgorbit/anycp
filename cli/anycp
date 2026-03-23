@@ -309,9 +309,9 @@ def _push_nc(filepath, args, cfg):
 
 # event_type → (reply_msg_type, handler_fn)
 PUSH_HANDLERS = {
-    "start_http_server": ("http_server_ready", _push_http),
-    "start_sky_share":   ("sky_share_ready",   _push_sky),
-    "start_nc_listen":   ("nc_listen_ready",   _push_nc),
+    "start_http_server": ("http_server_ready", _push_http, "http"),
+    "start_sky_share":   ("sky_share_ready",   _push_sky,  "sky"),
+    "start_nc_listen":   ("nc_listen_ready",   _push_nc,   "nc"),
 }
 
 
@@ -399,9 +399,9 @@ def _pop_nc(data, dest):
 
 # event_type → handler_fn
 POP_HANDLERS = {
-    "download_http": _pop_http,
-    "download_sky":  _pop_sky,
-    "download_nc":   _pop_nc,
+    "download_http": (_pop_http, "http"),
+    "download_sky":  (_pop_sky,  "sky"),
+    "download_nc":   (_pop_nc,   "nc"),
 }
 
 
@@ -458,8 +458,7 @@ def cmd_push(args, cfg):
                         edata.get("pop_host", "?")))
 
                 elif etype in PUSH_HANDLERS:
-                    protocol = etype
-                    reply_type, handler = PUSH_HANDLERS[etype]
+                    reply_type, handler, protocol = PUSH_HANDLERS[etype]
                     try:
                         data, new_cleanup = handler(filepath, args, cfg)
                         if cleanup:
@@ -578,8 +577,7 @@ def cmd_pop(args, cfg):
                 edata = ev.get("data", {})
 
                 if etype in POP_HANDLERS:
-                    protocol = etype
-                    handler = POP_HANDLERS[etype]
+                    handler, protocol = POP_HANDLERS[etype]
                     try:
                         handler(edata, tmp)
                         msg(cfg, tid, "pop", "download_complete")

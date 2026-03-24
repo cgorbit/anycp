@@ -417,7 +417,8 @@ def _pop_sky(data, dest):
     torrent_id = data["torrent_id"]
     original_path = data["path"]
 
-    tmpdir = tempfile.mkdtemp(prefix="anycp-sky-")
+    tmpdir = tempfile.mkdtemp(prefix="anycp-sky-", dir=".")
+    os.chmod(tmpdir, 0o775)
     try:
         print("  Running: sky get {}".format(torrent_id))
         result = subprocess.run(["sky", "get", torrent_id], cwd=tmpdir)
